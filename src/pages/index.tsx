@@ -1,10 +1,28 @@
+import dynamic from 'next/dynamic';
 import { useEffect, useState } from 'react';
-import { supabase } from '../lib/supabaseClient';
-import { Pie } from 'react-chartjs-2';
-import { Chart, ArcElement, Tooltip, Legend } from 'chart.js';
-Chart.register(ArcElement, Tooltip, Legend);
 
-// Simple client-side carbon calc (match server calculation)
+// Load Pie chart only on client (no SSR)
+const Pie = dynamic(() => import('react-chartjs-2').then(mod => mod.Pie), { ssr: false });
+
+// Safe client-side Chart.js registration inside useEffect
+function registerChartJs() {
+  // import dynamically so Node build doesn't load chart.js on server
+  return import('chart.js').then((mod) => {
+    const { Chart, ArcElement, Tooltip, Legend } = mod as any;
+    try {
+      // register only if not already registered
+      Chart.register(ArcElement, Tooltip, Legend);
+    } catch (err) {
+      // ignore already-registered errors
+      // console.warn('Chart register:', err);
+    }
+  }).catch((err) => {
+    // if Chart.js isn't installed, don't crash the whole page build/runtime
+    console.warn('Chart.js not available:', err);
+  });
+}
+
+// Simple carbon calc (client-side)
 function carbonForActivity(type: string, detail: string, amount: number, electricityFactor = 0.475) {
   const d = (detail || '').toLowerCase();
   switch (type) {
@@ -39,18 +57,22 @@ export default function Home() {
   const [type, setType] = useState('TRANSPORT');
   const [detail, setDetail] = useState('Car');
   const [amount, setAmount] = useState('');
-  const [elecFactor, setElecFactor] = useState(0.475);
+  const [elecFactor, setElecFactor] = useState<number>(Number(process.env.NEXT_PUBLIC_DEFAULT_ELEC_FACTOR ?? 0.475));
 
   useEffect(() => {
-    fetchActivities();
-    // subscribe can be added with supabase realtime for live updates
-  }, []);
+    // register Chart.js client-side only
+    registerChartJs();
 
-  async function fetchActivities() {
-    const res = await fetch('/api/activities');
-    const json = await res.json();
-    setActivities(json || []);
-  }
+    // fetch activities from API (if API not ready, handle gracefully)
+    fetch('/api/activities').then(async (r) => {
+      if (!r.ok) return;
+      const json = await r.json();
+      setActivities(json || []);
+    }).catch((err) => {
+      console.warn('Failed to fetch activities:', err);
+      setActivities([]);
+    });
+  }, []);
 
   async function addActivity() {
     const amt = parseFloat(amount);
@@ -63,20 +85,25 @@ export default function Home() {
       amount: amt,
       kg
     };
-    const res = await fetch('/api/activities', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    if (res.ok) {
+    try {
+      const res = await fetch('/api/activities', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+      if (!res.ok) {
+        const j = await res.json().catch(()=>({ error: 'unknown' }));
+        return alert('Error saving: ' + (j?.error || 'unknown'));
+      }
       setAmount('');
-      fetchActivities();
-    } else {
-      const j = await res.json();
-      alert('Error: ' + (j.error || 'unknown'));
+      // refresh
+      const data = await (await fetch('/api/activities')).json();
+      setActivities(data || []);
+    } catch (err: any) {
+      alert('Network error: ' + err?.message);
     }
   }
 
   // compute positive contributions per category
   const totals: Record<string, number> = {};
   activities.forEach(a => {
-    const k = parseFloat(a.kg) || 0;
+    const k = Number(a.kg) || 0;
     if (k <= 0) return;
     totals[a.type] = (totals[a.type] || 0) + k;
   });
@@ -94,8 +121,8 @@ export default function Home() {
   return (
     <div style={{ fontFamily: 'sans-serif', padding: 24 }}>
       <h1>EcoTracker — Web</h1>
-      <div style={{ display: 'flex', gap: 24 }}>
-        <div style={{ flex: 1 }}>
+      <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap' }}>
+        <div style={{ flex: '1 1 520px', minWidth: 320 }}>
           <h3>Log activity</h3>
           <div style={{ display:'grid', gridTemplateColumns: '1fr 1fr', gap:8 }}>
             <select value={type} onChange={e=>setType(e.target.value)}>
@@ -110,7 +137,7 @@ export default function Home() {
             <input value={amount} onChange={e=>setAmount(e.target.value)} placeholder="Amount (km, kWh, kg)" />
             <div>
               <label>Electricity factor (kg/kWh)</label>
-              <input type="number" step="0.01" value={elecFactor} onChange={e=>setElecFactor(parseFloat(e.target.value))} />
+              <input type="number" step="0.01" value={elecFactor} onChange={e=>setElecFactor(Number(e.target.value))} />
             </div>
           </div>
           <div style={{ marginTop: 12 }}>
@@ -118,23 +145,29 @@ export default function Home() {
           </div>
 
           <h3 style={{ marginTop: 24}}>History</h3>
-          <table border={1} cellPadding={6}>
-            <thead><tr><th>Date</th><th>Type</th><th>Detail</th><th>Amount</th><th>kg CO2</th></tr></thead>
-            <tbody>
-              {activities.map(a=>(
-                <tr key={a.id}>
-                  <td>{a.date}</td>
-                  <td>{a.type}</td>
-                  <td>{a.detail}</td>
-                  <td style={{ textAlign:'right' }}>{Number(a.amount).toFixed(2)}</td>
-                  <td style={{ textAlign:'right' }}>{Number(a.kg).toFixed(2)}</td>
+          <div style={{ maxHeight: 320, overflow: 'auto', border: '1px solid #ddd', padding: 8 }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr style={{ textAlign: 'left', borderBottom: '1px solid #eee' }}>
+                  <th>Date</th><th>Type</th><th>Detail</th><th style={{textAlign:'right'}}>Amount</th><th style={{textAlign:'right'}}>kg CO2</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {activities.map(a=>(
+                  <tr key={a.id}>
+                    <td>{a.date}</td>
+                    <td>{a.type}</td>
+                    <td>{a.detail}</td>
+                    <td style={{ textAlign:'right' }}>{Number(a.amount).toFixed(2)}</td>
+                    <td style={{ textAlign:'right' }}>{Number(a.kg).toFixed(2)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
 
-        <div style={{ width: 420 }}>
+        <div style={{ width: 420, minWidth: 320 }}>
           <h3>Emissions by category</h3>
           {labels.length ? <Pie data={pieData} /> : <p>No positive emissions recorded yet.</p>}
           <div style={{ marginTop: 12 }}>
